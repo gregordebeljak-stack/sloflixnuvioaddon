@@ -59,6 +59,13 @@ const catalogCache = new TTLCache(CATALOG_TTL_MS);
 const streamCache = new TTLCache(STREAM_TTL_MS);
 const clientCache = new Map(); // username -> SloFlixClient (keeps the login token warm)
 
+// Reused keep-alive agents for the /play/ proxy's upstream requests to the
+// SloFlix CDN. Without these, every Range request a player makes while
+// seeking opens a brand-new TCP+TLS connection from scratch; keeping
+// connections alive per-host cuts that latency substantially.
+const keepAliveHttpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 32 });
+const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 32 });
+
 const manifest = {
   id: 'com.jellysloflix.stremio',
   version: '1.1.0',
@@ -135,9 +142,10 @@ async function getCatalogData(client) {
   return catalogCache.getOrLoad(client.username, () => client.getCatalog());
 }
 
-function buildPlayUrl(config, mediaId) {
+function buildPlayUrl(config, mediaId, qualityIndex) {
   const configStr = encodeURIComponent(JSON.stringify(config));
-  return `${getPublicUrl()}/${configStr}/play/${encodeURIComponent(mediaId)}`;
+  const base = `${getPublicUrl()}/${configStr}/play/${encodeURIComponent(mediaId)}`;
+  return qualityIndex === undefined ? base : `${base}/${qualityIndex}`;
 }
 
 // Maps a custom catalog id to the SloFlix genre tag (as seen in the
@@ -201,19 +209,38 @@ builder.defineMetaHandler(async ({ type, id, config }) => {
 
 builder.defineStreamHandler(async ({ type, id, config }) => {
   const mediaId = fromId(id);
+  const client = getClient(config);
 
-  // Point the player at OUR OWN /play/ proxy instead of the raw SloFlix CDN
-  // URL: the SloFlix video source requires specific Referer/Origin headers
-  // (https://player.sloflix.com/), which Stremio/Nuvio players cannot send
-  // themselves. The proxy route below adds them server-side, same as the
-  // original JellySloFlix server.js bridge did for Jellyfin.
-  const stream = {
-    url: buildPlayUrl(config, mediaId),
-    title: 'SloFlix',
-    behaviorHints: { notWebReady: false }
-  };
+  // Resolve now (not lazily on first /play/ hit) so Stremio/Nuvio can show
+  // every available quality up front, sorted best-first, and so the actual
+  // /play/ request that follows is an instant cache hit instead of doing a
+  // fresh SloFlix API round-trip right when the user presses play.
+  try {
+    const resolved = await streamCache.getOrLoad(`${client.username}:${mediaId}`, () => client.resolveStream(mediaId));
+    const multipleQualities = resolved.streams.length > 1;
 
-  return { streams: [stream] };
+    return {
+      streams: resolved.streams.map((s, idx) => ({
+        url: buildPlayUrl(config, mediaId, idx),
+        title: multipleQualities ? `SloFlix - ${s.label}` : 'SloFlix',
+        behaviorHints: { notWebReady: false, bingeGroup: `sloflix-${mediaId}` }
+      }))
+    };
+  } catch (err) {
+    // Resolution failed (e.g. transient SloFlix API issue) — fall back to a
+    // single lazily-resolved stream, same as before, so the title still
+    // shows a playable option instead of none. /play/ will retry resolution
+    // and surface a clear 502 if it still fails.
+    return {
+      streams: [
+        {
+          url: buildPlayUrl(config, mediaId),
+          title: 'SloFlix',
+          behaviorHints: { notWebReady: false }
+        }
+      ]
+    };
+  }
 });
 
 // ==========================================
@@ -243,7 +270,7 @@ app.get('/configure', (_req, res) => {
   res.end(landingTemplate(manifest));
 });
 
-app.get('/:config/play/:mediaId', async (req, res) => {
+app.get('/:config/play/:mediaId/:qualityIndex?', async (req, res) => {
   try {
     const config = JSON.parse(decodeURIComponent(req.params.config));
     const client = getClient(config);
@@ -253,7 +280,11 @@ app.get('/:config/play/:mediaId', async (req, res) => {
       client.resolveStream(mediaId)
     );
 
-    await proxyStream(req, res, resolved.streamUrl);
+    const requestedIndex = parseInt(req.params.qualityIndex, 10);
+    const stream =
+      (!isNaN(requestedIndex) && resolved.streams[requestedIndex]) || resolved.streams[0];
+
+    await proxyStream(req, res, stream.streamUrl);
   } catch (err) {
     if (!res.headersSent) {
       res.status(502).send('SloFlix proxy error: ' + err.message);
@@ -288,11 +319,15 @@ function proxyStream(req, res, targetUrl, redirectCount = 0) {
 
     const isHttps = parsedUrl.protocol === 'https:';
     const httpLib = isHttps ? https : http;
+    const agent = isHttps ? keepAliveHttpsAgent : keepAliveHttpAgent;
 
     const headers = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       Referer: 'https://player.sloflix.com/',
-      Origin: 'https://player.sloflix.com'
+      Origin: 'https://player.sloflix.com',
+      // Video is already compressed; asking for gzip/br just burns CPU on
+      // both ends for zero size benefit and can add latency to first byte.
+      'Accept-Encoding': 'identity'
     };
     if (req.headers['range']) headers.range = req.headers['range'];
 
@@ -301,7 +336,8 @@ function proxyStream(req, res, targetUrl, redirectCount = 0) {
       port: parsedUrl.port || (isHttps ? 443 : 80),
       path: parsedUrl.pathname + parsedUrl.search,
       method: req.method || 'GET',
-      headers
+      headers,
+      agent
     };
 
     const upstreamReq = httpLib.request(options, (upstreamRes) => {
@@ -321,6 +357,11 @@ function proxyStream(req, res, targetUrl, redirectCount = 0) {
       upstreamRes.on('end', resolve);
       upstreamRes.on('error', reject);
     });
+
+    // Lower first-byte latency slightly by not waiting to coalesce small
+    // outgoing packets (irrelevant once the body is flowing, but helps the
+    // initial request/headers go out immediately).
+    upstreamReq.on('socket', (socket) => socket.setNoDelay(true));
 
     upstreamReq.on('error', (err) => {
       if (!res.headersSent) {
