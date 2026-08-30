@@ -72,7 +72,7 @@ const manifest = {
   version: '1.1.0',
   name: 'SloFlix',
   description:
-    'Gleda vaš SloFlix katalog (filmi in serije) neposredno v Stremiu, z uporabo vašega lastnega SloFlix računa.',
+    'SloFlix (filmi in serije) neposredno v Nuvio/Stremio, z uporabo vašega lastnega SloFlix računa.',
   logo: '/icon.png', // placeholder; rewritten to an absolute URL per-request in the manifest.json override below
   resources: ['catalog', 'meta', 'stream'],
   types: ['movie', 'series'],
