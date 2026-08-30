@@ -227,12 +227,15 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
   // fresh SloFlix API round-trip right when the user presses play.
   try {
     const resolved = await streamCache.getOrLoad(`${client.username}:${mediaId}`, () => client.resolveStream(mediaId));
-    const multipleQualities = resolved.streams.length > 1;
 
     return {
       streams: resolved.streams.map((s, idx) => ({
         url: buildPlayUrl(config, mediaId, idx),
-        title: multipleQualities ? `SloFlix - ${s.label}` : 'SloFlix',
+        // Show the detected quality whenever we found one (e.g. "SloFlix -
+        // 1080p"), even for a single remaining stream - not just when there
+        // are several to tell apart. Falls back to plain "SloFlix" only if
+        // no quality hint could be parsed from this source at all.
+        title: s.score ? `SloFlix - ${s.label}` : 'SloFlix',
         behaviorHints: { notWebReady: false, bingeGroup: `sloflix-${mediaId}` }
       }))
     };
