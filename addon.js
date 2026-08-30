@@ -9,7 +9,7 @@ const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const landingTemplate = require('stremio-addon-sdk/src/landingTemplate');
 const { SloFlixClient, DEFAULT_API_URL } = require('./lib/sloflixClient');
 const { TTLCache } = require('./lib/cache');
-const { toCatalogPreview, toMovieMeta, toSeriesMeta, fromId, pickGenres } = require('./lib/mappers');
+const { toCatalogPreview, toMovieMeta, toSeriesMeta, fromId, pickGenres, pickYear } = require('./lib/mappers');
 
 const PORT = process.env.PORT || 7860;
 const API_URL = process.env.SLOFLIX_API_URL || DEFAULT_API_URL;
@@ -72,7 +72,7 @@ const manifest = {
   version: '1.1.0',
   name: 'SloFlix',
   description:
-    'SloFlix (filmi in serije) neposredno v Nuvio/Stremio, z uporabo vašega lastnega SloFlix računa.',
+    'Gleda vaš SloFlix katalog (filmi in serije) neposredno v Stremiu, z uporabo vašega lastnega SloFlix računa.',
   logo: '/icon.png', // placeholder; rewritten to an absolute URL per-request in the manifest.json override below
   resources: ['catalog', 'meta', 'stream'],
   types: ['movie', 'series'],
@@ -185,6 +185,15 @@ builder.defineCatalogHandler(async ({ type, id, extra, config }) => {
   if (genreFilter) {
     items = items.filter((item) => pickGenres(item).includes(genreFilter));
   }
+
+  // Sort newest year first (same as SloFlix's own "Leto: najprej novejše"
+  // sort option). Items with no parseable year sink to the bottom instead of
+  // interrupting the year ordering.
+  items = [...items].sort((a, b) => {
+    const yearA = parseInt(pickYear(a), 10);
+    const yearB = parseInt(pickYear(b), 10);
+    return (isNaN(yearB) ? -Infinity : yearB) - (isNaN(yearA) ? -Infinity : yearA);
+  });
 
   if (!search) {
     // Only paginate the browse view; search results are typically few and
