@@ -6,7 +6,7 @@ const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const express = require('express');
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
-const landingTemplate = require('stremio-addon-sdk/src/landingTemplate');
+const renderConfigurePage = require('./lib/configurePage');
 const { SloFlixClient, DEFAULT_API_URL } = require('./lib/sloflixClient');
 const { TTLCache } = require('./lib/cache');
 const { toCatalogPreview, toMovieMeta, toSeriesMeta, fromId, pickGenres, pickYear } = require('./lib/mappers');
@@ -72,7 +72,7 @@ const manifest = {
   version: '1.1.0',
   name: 'SloFlix',
   description:
-    'Gleda vaš SloFlix katalog (filmi in serije) neposredno v Stremiu, z uporabo vašega lastnega SloFlix računa.',
+    'Glej Sloflix neposredno preko Nuvio ali Stremio, z vašim lastnim računom Sloflix.',
   logo: '/icon.png', // placeholder; rewritten to an absolute URL per-request in the manifest.json override below
   resources: ['catalog', 'meta', 'stream'],
   types: ['movie', 'series'],
@@ -299,7 +299,7 @@ app.use(getRouter(addonInterface));
 app.get('/', (_req, res) => res.redirect('/configure'));
 app.get('/configure', (_req, res) => {
   res.setHeader('content-type', 'text/html');
-  res.end(landingTemplate(manifest));
+  res.end(renderConfigurePage(manifest));
 });
 
 app.get('/:config/play/:mediaId/:qualityIndex?', async (req, res) => {
