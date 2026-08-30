@@ -15,6 +15,11 @@ const PORT = process.env.PORT || 7860;
 const API_URL = process.env.SLOFLIX_API_URL || DEFAULT_API_URL;
 const CATALOG_TTL_MS = 30 * 60 * 1000; // 30 min
 const STREAM_TTL_MS = 5 * 60 * 1000; // 5 min (SloFlix source links can expire)
+// How long the /play/ proxy waits for the upstream CDN to answer/keep
+// sending data before giving up. Without this, a slow/hung source has no
+// ceiling at all and the player (especially on Android TV) just spins
+// indefinitely instead of failing fast enough to retry another quality.
+const UPSTREAM_TIMEOUT_MS = 12 * 1000;
 
 // Fallback base URL, used only when there is no incoming HTTP request to read
 // (e.g. the startup log line below). Real /play/ links are built from the
@@ -372,7 +377,14 @@ function proxyStream(req, res, targetUrl, redirectCount = 0) {
       path: parsedUrl.pathname + parsedUrl.search,
       method: req.method || 'GET',
       headers,
-      agent
+      agent,
+      // Fail fast instead of leaving the player's spinner running for
+      // minutes: this is what a hung/slow source (e.g. a P2P-style relay
+      // that never finishes peer discovery) used to look like, especially
+      // on Android TV boxes with less networking headroom than a phone. If
+      // the upstream hasn't answered within this window, give up and let
+      // the 'timeout' handler below turn it into a fast, clear 504 instead.
+      timeout: UPSTREAM_TIMEOUT_MS
     };
 
     const upstreamReq = httpLib.request(options, (upstreamRes) => {
@@ -397,6 +409,12 @@ function proxyStream(req, res, targetUrl, redirectCount = 0) {
     // outgoing packets (irrelevant once the body is flowing, but helps the
     // initial request/headers go out immediately).
     upstreamReq.on('socket', (socket) => socket.setNoDelay(true));
+
+    // Node's `timeout` request option only *emits* this event on stall; it
+    // does not abort the request by itself, so we still have to do that.
+    upstreamReq.on('timeout', () => {
+      upstreamReq.destroy(new Error(`Vir se ni odzval znotraj ${UPSTREAM_TIMEOUT_MS / 1000}s`));
+    });
 
     upstreamReq.on('error', (err) => {
       if (!res.headersSent) {
