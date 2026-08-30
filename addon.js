@@ -8,7 +8,7 @@ const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const landingTemplate = require('stremio-addon-sdk/src/landingTemplate');
 const { SloFlixClient, DEFAULT_API_URL } = require('./lib/sloflixClient');
 const { TTLCache } = require('./lib/cache');
-const { toCatalogPreview, toMovieMeta, toSeriesMeta, fromId } = require('./lib/mappers');
+const { toCatalogPreview, toMovieMeta, toSeriesMeta, fromId, pickGenres } = require('./lib/mappers');
 
 const PORT = process.env.PORT || 7860;
 const API_URL = process.env.SLOFLIX_API_URL || DEFAULT_API_URL;
@@ -86,6 +86,24 @@ const manifest = {
         { name: 'search', isRequired: false },
         { name: 'skip', isRequired: false }
       ]
+    },
+    {
+      type: 'movie',
+      id: 'sloflix-slovenski',
+      name: 'SloFlix Slovenski filmi',
+      extra: [
+        { name: 'search', isRequired: false },
+        { name: 'skip', isRequired: false }
+      ]
+    },
+    {
+      type: 'movie',
+      id: 'sloflix-slosinh',
+      name: 'SloFlix SLOSiNH (risanke in risani filmi)',
+      extra: [
+        { name: 'search', isRequired: false },
+        { name: 'skip', isRequired: false }
+      ]
     }
   ],
   idPrefixes: ['sloflix:'],
@@ -122,16 +140,25 @@ function buildPlayUrl(config, mediaId) {
   return `${getPublicUrl()}/${configStr}/play/${encodeURIComponent(mediaId)}`;
 }
 
+// Maps a custom catalog id to the SloFlix genre tag (as seen in the
+// "Filtriraj in razvrsti" filter on sloflix.com, e.g. media_genres containing
+// "Slovenski" or "SLOSiNH") it should be restricted to.
+const GENRE_CATALOGS = {
+  'sloflix-slovenski': 'Slovenski',
+  'sloflix-slosinh': 'SLOSiNH'
+};
+
 // ==========================================
 // Stremio addon resource handlers
 // ==========================================
 const builder = new addonBuilder(manifest);
 
-builder.defineCatalogHandler(async ({ type, extra, config }) => {
+builder.defineCatalogHandler(async ({ type, id, extra, config }) => {
   const client = getClient(config);
   const search = extra && extra.search;
   const skip = (extra && parseInt(extra.skip, 10)) || 0;
   const pageSize = 100;
+  const genreFilter = GENRE_CATALOGS[id];
 
   let items;
   if (search) {
@@ -144,6 +171,15 @@ builder.defineCatalogHandler(async ({ type, extra, config }) => {
   } else {
     const { movies, shows } = await getCatalogData(client);
     items = type === 'movie' ? movies : shows;
+  }
+
+  if (genreFilter) {
+    items = items.filter((item) => pickGenres(item).includes(genreFilter));
+  }
+
+  if (!search) {
+    // Only paginate the browse view; search results are typically few and
+    // Stremio doesn't send `skip` for them anyway.
     items = items.slice(skip, skip + pageSize);
   }
 
