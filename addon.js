@@ -2,6 +2,7 @@
 
 const http = require('http');
 const https = require('https');
+const { AsyncLocalStorage } = require('async_hooks');
 const express = require('express');
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const landingTemplate = require('stremio-addon-sdk/src/landingTemplate');
@@ -14,13 +15,45 @@ const API_URL = process.env.SLOFLIX_API_URL || DEFAULT_API_URL;
 const CATALOG_TTL_MS = 30 * 60 * 1000; // 30 min
 const STREAM_TTL_MS = 5 * 60 * 1000; // 5 min (SloFlix source links can expire)
 
-// Public base URL used to build the /play/... proxy links returned to
-// Stremio/Nuvio. Render sets RENDER_EXTERNAL_URL automatically; for other
-// hosts set PUBLIC_URL yourself (see README).
-const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || `http://127.0.0.1:${PORT}`).replace(
-  /\/+$/,
-  ''
-);
+// Fallback base URL, used only when there is no incoming HTTP request to read
+// (e.g. the startup log line below). Real /play/ links are built from the
+// actual request instead — see requestContext/getPublicUrl() — so this never
+// causes the "stuck on nalaganje" bug even if left unset or wrong.
+const FALLBACK_PUBLIC_URL = (
+  process.env.PUBLIC_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  `http://127.0.0.1:${PORT}`
+).replace(/\/+$/, '');
+
+// Per-request storage so buildPlayUrl() (called from inside
+// defineStreamHandler, which the stremio-addon-sdk invokes without giving us
+// access to the Express `req`) can still recover the base URL the *current*
+// request actually came in on. AsyncLocalStorage keeps this correctly scoped
+// per concurrent request (unlike a plain module-level variable, which would
+// be a race condition under concurrent requests).
+const requestContext = new AsyncLocalStorage();
+
+function detectBaseUrl(req) {
+  // req.protocol honors X-Forwarded-Proto once 'trust proxy' is enabled
+  // below (needed behind Render's proxy, Docker reverse proxies, Cloudflare,
+  // etc.). req.get('host'), however, always returns the RAW Host header
+  // regardless of the trust proxy setting, so we check X-Forwarded-Host
+  // ourselves (first entry, in case of a comma-separated proxy chain).
+  const forwardedHost = req.headers['x-forwarded-host'];
+  const host = (forwardedHost ? forwardedHost.split(',')[0].trim() : '') || req.get('host');
+  if (!host) return FALLBACK_PUBLIC_URL;
+  return `${req.protocol}://${host}`.replace(/\/+$/, '');
+}
+
+function getPublicUrl() {
+  // Explicit PUBLIC_URL env var still wins if the operator set one on
+  // purpose (e.g. addon reachable at a different public address than the
+  // Host header it sees, such as behind a tunnel with URL rewriting).
+  // Otherwise use the address the current request actually arrived on.
+  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/+$/, '');
+  const store = requestContext.getStore();
+  return (store && store.baseUrl) || FALLBACK_PUBLIC_URL;
+}
 
 const catalogCache = new TTLCache(CATALOG_TTL_MS);
 const streamCache = new TTLCache(STREAM_TTL_MS);
@@ -86,7 +119,7 @@ async function getCatalogData(client) {
 
 function buildPlayUrl(config, mediaId) {
   const configStr = encodeURIComponent(JSON.stringify(config));
-  return `${PUBLIC_URL}/${configStr}/play/${encodeURIComponent(mediaId)}`;
+  return `${getPublicUrl()}/${configStr}/play/${encodeURIComponent(mediaId)}`;
 }
 
 // ==========================================
@@ -152,6 +185,20 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
 // ==========================================
 const addonInterface = builder.getInterface();
 const app = express();
+
+// Required so req.protocol / req.get('host') reflect the ORIGINAL public
+// request (via X-Forwarded-Proto / X-Forwarded-Host) rather than the
+// internal proxy hop's own scheme/host — Render and most other hosts sit
+// behind such a proxy.
+app.set('trust proxy', true);
+
+// Capture the base URL of the incoming request BEFORE handing off to the
+// addon router, so buildPlayUrl() (invoked later, deep inside
+// defineStreamHandler) can read it back via requestContext/getPublicUrl().
+app.use((req, _res, next) => {
+  requestContext.run({ baseUrl: detectBaseUrl(req) }, next);
+});
+
 app.use(getRouter(addonInterface));
 
 app.get('/', (_req, res) => res.redirect('/configure'));
@@ -254,6 +301,10 @@ function proxyStream(req, res, targetUrl, redirectCount = 0) {
 
 app.listen(PORT, () => {
   console.log(`SloFlix Stremio addon posluša na vratih ${PORT}`);
-  console.log(`Javni naslov (za /play/ povezave): ${PUBLIC_URL}`);
-  console.log(`Odprite ${PUBLIC_URL}/configure za konfiguracijo in namestitev.`);
+  console.log(
+    `Javni naslov za /play/ povezave se samodejno zazna iz vsake zahteve` +
+      (process.env.PUBLIC_URL ? ` (ročno prepisan s PUBLIC_URL=${process.env.PUBLIC_URL})` : '') +
+      '.'
+  );
+  console.log(`Odprite ${FALLBACK_PUBLIC_URL}/configure za konfiguracijo in namestitev.`);
 });

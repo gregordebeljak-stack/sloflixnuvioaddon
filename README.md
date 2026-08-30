@@ -124,23 +124,28 @@ točk deluje, in je manj zanesljiv, ker SloFlix nima TMDB povezave.
 Katalog se predpomni za 30 minut, razrešeni pretoki (SloFlix source URL, ne
 sam video) pa za 5 minut (SloFlix viri lahko po določenem času potečejo).
 
-### `PUBLIC_URL` — pomembno pri gostovanju
+### Javni naslov za `/play/` povezave
 
 Addon mora vedeti svoj **javni** naslov, da lahko sestavi `/play/` povezave, ki
-jih dobi Stremio/Nuvio. Na Renderju se to zgodi samodejno (`RENDER_EXTERNAL_URL`).
-Pri drugem gostovanju/VPS/Dockerju nastavite spremenljivko okolja `PUBLIC_URL`,
-npr. `PUBLIC_URL=http://VAŠ_SERVER_IP:7860` (ali `https://vasa-domena.si`) —
-sicer se privzame `http://127.0.0.1:PORT`, kar iz drugih naprav ne bo dosegljivo
-in bo predvajanje spet odpovedalo, čeprav se katalog normalno naloži.
+jih dobi Stremio/Nuvio. Ta naslov se **samodejno zazna iz vsake dohodne
+zahteve** (protokol/host, vključno z `X-Forwarded-Proto`/`X-Forwarded-Host` za
+gostovanje za reverse proxyjem), zato deluje ne glede na to, kje addon gostuje
+— Render, VPS, Docker, ngrok/tunnel ipd. — brez ročne nastavitve.
+
+Če je vaša postavitev nenavadna (npr. addon vidi drug Host header, kot je
+njegov dejanski javni naslov) lahko samodetekcijo še vedno ročno preglasite s
+spremenljivko okolja `PUBLIC_URL`, npr. `PUBLIC_URL=https://vasa-domena.si` —
+to ni več potrebno v običajnih primerih.
 
 ## 7. Odpravljanje težav: katalog se naloži, video se ne predvaja
 
 To je skoraj vedno eden od teh dveh vzrokov:
 
-1. **`PUBLIC_URL` ni pravilen** (glejte zgoraj) — Nuvio/Stremio poskuša doseči
-   naslov, ki ni dosegljiv iz vaše naprave. Preverite ga tako, da `/play/...`
-   povezavo iz razdelka "Stream" v Stremio/Nuvio odprete neposredno v
-   brskalniku na drugi napravi.
+1. **Naslov, ki ga vidi Nuvio/Stremio, ni dosegljiv iz vaše naprave** — npr. če
+   ročno nastavljen `PUBLIC_URL` kaže na napačen naslov, ali če je addon za
+   proxyjem, ki ne pošilja `X-Forwarded-Host`/`X-Forwarded-Proto`. Preverite
+   ga tako, da `/play/...` povezavo iz razdelka "Stream" v Stremio/Nuvio
+   odprete neposredno v brskalniku na drugi napravi.
 2. **SloFlix prijava odpove** (poteklo geslo, spremenjen API) — v tem primeru
    proxy pot vrne HTTP 502 z besedilom napake namesto videa. Preverite loge
    strežnika (`docker compose logs -f` oz. Render "Logs" zavihek).
