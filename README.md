@@ -113,18 +113,40 @@ točk deluje, in je manj zanesljiv, ker SloFlix nima TMDB povezave.
   in straničenje (skip).
 - **Meta**: podrobnosti filma/serije, pri serijah vključno s seznamom epizod po
   sezonah (pridobljeno iz `/v1/media/episodes/:showId/:season`).
-- **Stream**: razreši neposredno povezavo do videa preko `/v1/media/single/:id`,
-  enako kot originalni `server.js` (`resolveMedia`), in doda slovenske podnapise,
-  če so na voljo.
+- **Stream**: addon vrne povezavo do svoje **lastne proxy poti** `/:config/play/:id`,
+  ki šele takrat pokliče `/v1/media/single/:id` (enako kot originalni `server.js`
+  `resolveMedia`) in dejanski video pretoči naprej z dodanimi glavami
+  `Referer`/`Origin: https://player.sloflix.com/`. Te glave SloFlix CDN
+  zahteva za predvajanje — Stremio/Nuvio jih sam ne more poslati, zato jih
+  original ni pošiljal playerju direktno, ampak je imel enak proxy korak.
+  Proxy podpira tudi `Range` zahteve (previjanje/seek) in sledi HTTP redirectom.
 
-Katalog se predpomni za 30 minut, razrešeni pretoki pa za 5 minut (SloFlix viri
-lahko po določenem času potečejo).
+Katalog se predpomni za 30 minut, razrešeni pretoki (SloFlix source URL, ne
+sam video) pa za 5 minut (SloFlix viri lahko po določenem času potečejo).
 
-## 7. Omejitve / stvari, ki jih original ni imel
+### `PUBLIC_URL` — pomembno pri gostovanju
 
-- Ni proxy/redirect logike za HTTP Range requeste kot `server.js` — Stremio
-  predvaja direktno povezavo do vira. Če bi viri zahtevali posebne glave
-  (`Referer`/`Origin`), jih je treba dodati v `stream.behaviorHints.proxyHeaders`.
+Addon mora vedeti svoj **javni** naslov, da lahko sestavi `/play/` povezave, ki
+jih dobi Stremio/Nuvio. Na Renderju se to zgodi samodejno (`RENDER_EXTERNAL_URL`).
+Pri drugem gostovanju/VPS/Dockerju nastavite spremenljivko okolja `PUBLIC_URL`,
+npr. `PUBLIC_URL=http://VAŠ_SERVER_IP:7860` (ali `https://vasa-domena.si`) —
+sicer se privzame `http://127.0.0.1:PORT`, kar iz drugih naprav ne bo dosegljivo
+in bo predvajanje spet odpovedalo, čeprav se katalog normalno naloži.
+
+## 7. Odpravljanje težav: katalog se naloži, video se ne predvaja
+
+To je skoraj vedno eden od teh dveh vzrokov:
+
+1. **`PUBLIC_URL` ni pravilen** (glejte zgoraj) — Nuvio/Stremio poskuša doseči
+   naslov, ki ni dosegljiv iz vaše naprave. Preverite ga tako, da `/play/...`
+   povezavo iz razdelka "Stream" v Stremio/Nuvio odprete neposredno v
+   brskalniku na drugi napravi.
+2. **SloFlix prijava odpove** (poteklo geslo, spremenjen API) — v tem primeru
+   proxy pot vrne HTTP 502 z besedilom napake namesto videa. Preverite loge
+   strežnika (`docker compose logs -f` oz. Render "Logs" zavihek).
+
+## 8. Omejitve / stvari, ki jih original ni imel
+
 - Ni filtriranja po žanru/letnici/oceni v katalogu — po potrebi dodajte `extra`
   polja v manifest in filter v `defineCatalogHandler`.
 - ID-ji filmov/serij so SloFlix-specifični (`sloflix:<id>`), ne IMDb/TMDB, zato
