@@ -2,6 +2,7 @@
 
 const http = require('http');
 const https = require('https');
+const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const express = require('express');
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
@@ -72,7 +73,7 @@ const manifest = {
   name: 'SloFlix',
   description:
     'Gleda vaš SloFlix katalog (filmi in serije) neposredno v Stremiu, z uporabo vašega lastnega SloFlix računa.',
-  logo: 'https://sloflix.com/favicon.ico',
+  logo: '/icon.png', // placeholder; rewritten to an absolute URL per-request in the manifest.json override below
   resources: ['catalog', 'meta', 'stream'],
   types: ['movie', 'series'],
   catalogs: [
@@ -260,6 +261,28 @@ app.set('trust proxy', true);
 // defineStreamHandler) can read it back via requestContext/getPublicUrl().
 app.use((req, _res, next) => {
   requestContext.run({ baseUrl: detectBaseUrl(req) }, next);
+});
+
+// Serve the actual icon file, and override the SDK's default manifest.json
+// route to inject its full, request-detected absolute URL. We can't just put
+// a data: URI or absolute URL straight in the static `manifest` object above:
+// a data URI pushes the manifest over the SDK's hard 8kb size limit, and a
+// hardcoded absolute URL would break as soon as the addon is reachable at a
+// different host (same reasoning as the /play/ URL auto-detection above).
+const ICON_PATH = path.join(__dirname, 'assets', 'icon.png');
+app.get('/icon.png', (_req, res) => res.sendFile(ICON_PATH));
+
+app.get('/:config?/manifest.json', (req, res) => {
+  const manifestResp = JSON.parse(JSON.stringify(manifest));
+  manifestResp.logo = `${detectBaseUrl(req)}/icon.png`;
+  if (req.params.config && manifestResp.behaviorHints) {
+    // Same as the SDK's own manifestHandler: once configured, drop these so
+    // the addon is treated as already installed rather than needing setup.
+    delete manifestResp.behaviorHints.configurationRequired;
+    delete manifestResp.behaviorHints.configurable;
+  }
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.json(manifestResp);
 });
 
 app.use(getRouter(addonInterface));
