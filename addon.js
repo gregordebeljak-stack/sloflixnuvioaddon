@@ -154,6 +154,19 @@ function buildPlayUrl(config, mediaId, qualityIndex) {
   return qualityIndex === undefined ? base : `${base}/${qualityIndex}`;
 }
 
+// Same idea as buildPlayUrl, but for the proxied Slovenian-subtitle file that
+// belongs to a given resolved stream (see /subs/ route below). Proxying
+// through our own server - instead of handing Stremio/Nuvio the raw SloFlix
+// subtitle URL - matters here for the same reason /play/ proxies video: the
+// SloFlix subtitle host expects a Referer/Origin it recognizes, which a
+// player's own subtitle fetcher won't send, and it needs to survive past the
+// 5-minute streamCache TTL that the raw resolved URL may be tied to.
+function buildSubsUrl(config, mediaId, qualityIndex) {
+  const configStr = encodeURIComponent(JSON.stringify(config));
+  const base = `${getPublicUrl()}/${configStr}/subs/${encodeURIComponent(mediaId)}`;
+  return qualityIndex === undefined ? base : `${base}/${qualityIndex}`;
+}
+
 // Maps a custom catalog id to the SloFlix genre tag (as seen in the
 // "Filtriraj in razvrsti" filter on sloflix.com, e.g. media_genres containing
 // "Slovenski" or "SLOSiNH") it should be restricted to.
@@ -241,6 +254,16 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
         // are several to tell apart. Falls back to plain "SloFlix" only if
         // no quality hint could be parsed from this source at all.
         title: s.score ? `SloFlix - ${s.label}` : 'SloFlix',
+        // SloFlix already ships built-in/adapted Slovenian subtitles per
+        // source (sloflixClient.resolveStream() extracts subtitleUrl from
+        // subtitle_location/subtitles/subtitle) - the website's own player
+        // shows them, but until now this addon just dropped that URL on the
+        // floor instead of surfacing it, which is why Stremio/Nuvio never
+        // displayed them. Proxied through /subs/ (see below) so the SloFlix
+        // subtitle host sees the Referer/Origin it expects.
+        subtitles: s.subtitleUrl
+          ? [{ id: `sloflix-slv-${mediaId}-${idx}`, url: buildSubsUrl(config, mediaId, idx), lang: 'slv' }]
+          : undefined,
         behaviorHints: { notWebReady: false, bingeGroup: `sloflix-${mediaId}` }
       }))
     };
@@ -334,6 +357,38 @@ app.get('/:config/play/:mediaId/:qualityIndex?', async (req, res) => {
   }
 });
 
+app.get('/:config/subs/:mediaId/:qualityIndex?', async (req, res) => {
+  try {
+    const config = JSON.parse(decodeURIComponent(req.params.config));
+    const client = getClient(config);
+    const mediaId = req.params.mediaId;
+
+    // Reuses the same cache entry /play/ populates (resolveStream() already
+    // carries subtitleUrl alongside streamUrl for each source), so this is
+    // normally an instant cache hit rather than a fresh SloFlix round-trip.
+    const resolved = await streamCache.getOrLoad(`${client.username}:${mediaId}`, () =>
+      client.resolveStream(mediaId)
+    );
+
+    const requestedIndex = parseInt(req.params.qualityIndex, 10);
+    const stream =
+      (!isNaN(requestedIndex) && resolved.streams[requestedIndex]) || resolved.streams[0];
+
+    if (!stream || !stream.subtitleUrl) {
+      res.status(404).send('Za to vsebino ni na voljo slovenskih podnapisov.');
+      return;
+    }
+
+    await proxySubtitle(req, res, stream.subtitleUrl);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(502).send('SloFlix subtitle proxy error: ' + err.message);
+    } else {
+      res.end();
+    }
+  }
+});
+
 /**
  * Streams the upstream SloFlix video URL back to the client, adding the
  * Referer/Origin headers the SloFlix CDN requires, following redirects, and
@@ -420,6 +475,90 @@ function proxyStream(req, res, targetUrl, redirectCount = 0) {
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'text/plain' });
         res.end('Upstream request error: ' + err.message);
+      }
+      reject(err);
+    });
+
+    req.on('close', () => upstreamReq.destroy());
+    upstreamReq.end();
+  });
+}
+
+/**
+ * Proxies a SloFlix subtitle file back to the client. Separate from
+ * proxyStream() above (rather than reused) because subtitles need different
+ * Referer/Origin (the main sloflix.com site, not the player.sloflix.com CDN
+ * host) and because we normalize a missing/generic Content-Type to a real
+ * subtitle MIME - SloFlix's static file server sometimes answers with
+ * application/octet-stream, which makes some players silently refuse to
+ * treat the response as a subtitle track at all.
+ */
+function proxySubtitle(req, res, targetUrl, redirectCount = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirectCount > 5) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('Too many redirects');
+      return resolve();
+    }
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(targetUrl);
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Invalid subtitle URL');
+      return resolve();
+    }
+
+    const isHttps = parsedUrl.protocol === 'https:';
+    const httpLib = isHttps ? https : http;
+    const agent = isHttps ? keepAliveHttpsAgent : keepAliveHttpAgent;
+
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (isHttps ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Referer: 'https://sloflix.com/',
+        Origin: 'https://sloflix.com',
+        'Accept-Encoding': 'identity'
+      },
+      agent,
+      timeout: UPSTREAM_TIMEOUT_MS
+    };
+
+    const upstreamReq = httpLib.request(options, (upstreamRes) => {
+      if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
+        const redirectUrl = new URL(upstreamRes.headers.location, targetUrl).toString();
+        upstreamRes.resume();
+        return resolve(proxySubtitle(req, res, redirectUrl, redirectCount + 1));
+      }
+
+      let contentType = upstreamRes.headers['content-type'];
+      if (!contentType || /octet-stream/i.test(contentType)) {
+        contentType = /\.vtt(\?|$)/i.test(targetUrl) ? 'text/vtt; charset=utf-8' : 'application/x-subrip; charset=utf-8';
+      }
+
+      res.writeHead(upstreamRes.statusCode, {
+        'Content-Type': contentType,
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600'
+      });
+      upstreamRes.pipe(res);
+      upstreamRes.on('end', resolve);
+      upstreamRes.on('error', reject);
+    });
+
+    upstreamReq.on('timeout', () => {
+      upstreamReq.destroy(new Error(`Podnapisi se niso odzvali znotraj ${UPSTREAM_TIMEOUT_MS / 1000}s`));
+    });
+
+    upstreamReq.on('error', (err) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('Subtitle proxy error: ' + err.message);
       }
       reject(err);
     });
