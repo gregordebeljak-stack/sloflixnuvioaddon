@@ -11,6 +11,16 @@
 // or find nothing for shows with very different Slovene naming.
 //
 // Fill in your own SloFlix + TMDB credentials below before using.
+//
+// NOTE ON SUBTITLES: this file is a Nuvio "Local Scraper" - its getStreams()
+// return format (name/title/url/quality/headers/provider) has no subtitle
+// field in Nuvio's own spec, so SloFlix's Slovenian subtitles genuinely
+// cannot be attached this way, no matter what's added here. If you want
+// subtitles in Nuvio, don't use this file - instead install the addon.js
+// server in this project as a regular Nuvio/Stremio ADDON (Settings ->
+// Addons -> paste its /manifest.json URL, NOT Settings -> Local Scrapers).
+// That addon returns proper Stream objects with a `subtitles` array, which
+// both Stremio and Nuvio do support and display.
 
 const SLOFLIX_API_URL = 'https://api.sloflix.com';
 const SLOFLIX_USERNAME = 'YOUR_SLOFLIX_EMAIL';
