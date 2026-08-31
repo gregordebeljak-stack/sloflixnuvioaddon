@@ -88,23 +88,22 @@ const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 3
 
 const manifest = {
   id: 'com.jellysloflix.stremio',
-  version: '1.4.0',
+  version: '1.3.0',
   name: 'SloFlix',
   description:
     'Glej Sloflix neposredno preko Nuvio ali Stremio, z vašim lastnim računom Sloflix. Vključno s slovenskimi podnapisi SloFlix - tudi za vsebino, ki jo predvajate iz katerega koli drugega addona (Torrentio, Comet ...), ne le iz tega.',
   logo: '/icon.png', // placeholder; rewritten to an absolute URL per-request in the manifest.json override below
-  // catalog/meta stay scoped to our own 'sloflix:' ids exactly as before.
-  // stream and subtitles are ALSO scoped to 'tt' (IMDb) ids - that's what
-  // lets Stremio/Nuvio query THIS addon for a SloFlix source (and Slovenian
-  // subtitles) whenever the user searches/opens ANY title via IMDb metadata
-  // (Cinemeta), not just when browsing our own "SloFlix Filmi"/"Serije"
-  // catalogs. Without the 'tt' prefix here, SloFlix never showed up
-  // alongside Torrentio/ThePirateBay+/AIOStreams etc. in Nuvio's stream
-  // picker for titles found via search.
+  // catalog/meta/stream stay scoped to our own 'sloflix:' ids exactly as
+  // before. subtitles is scoped separately to 'tt' (IMDb) ids instead -
+  // that's what lets Stremio/Nuvio query THIS addon for Slovenian subtitles
+  // no matter which addon actually supplied the video stream being played.
+  // (Our own catalog's streams already carry their subtitles inline, set in
+  // defineStreamHandler below, so this handler only needs to cover the
+  // 'tt:' case - see defineSubtitlesHandler.)
   resources: [
     'catalog',
     { name: 'meta', types: ['movie', 'series'], idPrefixes: ['sloflix:'] },
-    { name: 'stream', types: ['movie', 'series'], idPrefixes: ['sloflix:', 'tt'] },
+    { name: 'stream', types: ['movie', 'series'], idPrefixes: ['sloflix:'] },
     // 'sloflix:' is included here (alongside 'tt') so Nuvio's own subtitle
     // picker - which only ever queries this standalone resource, and does
     // NOT read the inline `subtitles` array set on stream objects in
@@ -342,64 +341,9 @@ builder.defineMetaHandler(async ({ type, id, config }) => {
   return { meta: toSeriesMeta(item, episodes) };
 });
 
-// Turns whatever id Stremio/Nuvio hands defineStreamHandler into a concrete
-// SloFlix media id: our own 'sloflix:' ids decode directly, while any other
-// (IMDb 'tt...', optionally ':season:episode' for series) is matched against
-// the SloFlix catalog the same way defineSubtitlesHandler already does below
-// - Cinemeta title/year lookup, then a best-effort title/year catalog match.
-// Returns null on no match (never throws for "not found" - only for actual
-// SloFlix/network failures, which the caller treats the same way).
-async function resolveMediaIdForStream(type, id, client) {
-  if (String(id).startsWith('sloflix:')) {
-    return fromId(id);
-  }
-
-  const [imdbId, seasonStr, episodeStr] = String(id).split(':');
-  const season = seasonStr ? parseInt(seasonStr, 10) : null;
-  const episode = episodeStr ? parseInt(episodeStr, 10) : null;
-
-  const { title, year } = await titleCache.getOrLoad(`${type}:${imdbId}`, () => fetchCinemetaTitle(type, imdbId));
-  if (!title) return null;
-
-  const match = await matchCache.getOrLoad(`${client.username}:${type}:${imdbId}`, async () => {
-    const results = await client.searchCatalog(title);
-    return pickBestMatch(results, title, year);
-  });
-  if (!match) return null;
-
-  let mediaId = match.media_id || match.id;
-
-  if (type === 'series') {
-    if (!season || !episode) return null;
-    const episodes = await matchCache.getOrLoad(`${client.username}:episodes:${mediaId}`, () =>
-      client.getShowEpisodes(mediaId)
-    );
-    const ep = episodes.find((e) => e.season === season && e.episode === episode);
-    if (!ep) return null;
-    mediaId = ep.id || ep.media_id;
-  }
-
-  return mediaId;
-}
-
 builder.defineStreamHandler(async ({ type, id, config }) => {
-  let client;
-  try {
-    client = getClient(config);
-  } catch (err) {
-    // Not configured (no username/password) yet - contribute nothing rather
-    // than erroring the whole request, since for 'tt' ids this addon is
-    // queried alongside every other installed addon.
-    return { streams: [] };
-  }
-
-  let mediaId;
-  try {
-    mediaId = await resolveMediaIdForStream(type, id, client);
-  } catch (err) {
-    mediaId = null; // Cinemeta/SloFlix lookup failed - treat as "no match"
-  }
-  if (!mediaId) return { streams: [] };
+  const mediaId = fromId(id);
+  const client = getClient(config);
 
   // Resolve now (not lazily on first /play/ hit) so Stremio/Nuvio can show
   // every available quality up front, sorted best-first, and so the actual
