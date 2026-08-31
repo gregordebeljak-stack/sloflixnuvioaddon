@@ -103,7 +103,15 @@ const manifest = {
   resources: [
     'catalog',
     { name: 'meta', types: ['movie', 'series'], idPrefixes: ['sloflix:'] },
-    { name: 'stream', types: ['movie', 'series'], idPrefixes: ['sloflix:'] },
+    // 'tt' (IMDb) is included here alongside 'sloflix:' so that multi-source
+    // stream finders (AIOStreams, Comet-based aggregators, Stremio/Nuvio
+    // itself when a title was opened via ANY other catalog/addon) also ask
+    // THIS addon for streams. Without 'tt' here, SloFlix only ever showed up
+    // as a source for titles browsed from its own catalog - never when the
+    // same movie/show was found via Cinemeta/TMDB-backed catalogs, which is
+    // how most stream-finder UIs operate. See defineStreamHandler below for
+    // the IMDb-id -> SloFlix title match this enables.
+    { name: 'stream', types: ['movie', 'series'], idPrefixes: ['sloflix:', 'tt'] },
     // 'sloflix:' is included here (alongside 'tt') so Nuvio's own subtitle
     // picker - which only ever queries this standalone resource, and does
     // NOT read the inline `subtitles` array set on stream objects in
@@ -279,6 +287,84 @@ const GENRE_CATALOGS = {
 const BASE_CATALOGS = new Set(['sloflix-movies', 'sloflix-series']);
 const EXCLUDED_FROM_BASE_GENRES = [...new Set(Object.values(GENRE_CATALOGS))];
 
+// Resolves an external "tt1234567" / "tt1234567:1:5" id (IMDb id, optionally
+// with season:episode for a series episode) to the matching SloFlix
+// media_id, via Cinemeta title lookup -> SloFlix catalog search -> best
+// title/year match. Shared by defineStreamHandler and defineSubtitlesHandler
+// so both resolve external ids the exact same way (and share the same
+// title/match caches, so looking up streams for a title also warms the
+// cache used later for its subtitles, and vice versa).
+// Returns the matched SloFlix media_id, or null if nothing matched.
+async function resolveExternalId(type, client, imdbId, season, episode) {
+  const { title, year } = await titleCache.getOrLoad(`${type}:${imdbId}`, () => fetchCinemetaTitle(type, imdbId));
+  if (!title) return null;
+
+  const match = await matchCache.getOrLoad(`${client.username}:${type}:${imdbId}`, async () => {
+    const results = await client.searchCatalog(title);
+    return pickBestMatch(results, title, year);
+  });
+  if (!match) return null;
+
+  let mediaId = match.media_id || match.id;
+
+  if (type === 'series') {
+    if (!season || !episode) return null;
+    const episodes = await matchCache.getOrLoad(`${client.username}:episodes:${mediaId}`, () =>
+      client.getShowEpisodes(mediaId)
+    );
+    const ep = episodes.find((e) => e.season === season && e.episode === episode);
+    if (!ep) return null;
+    mediaId = ep.id || ep.media_id;
+  }
+
+  return mediaId;
+}
+
+// Builds the Stremio `streams` array for an already-known SloFlix mediaId -
+// shared by defineStreamHandler's two entry points (its own 'sloflix:'
+// catalog ids, and external 'tt' ids resolved via resolveExternalId above).
+async function buildStreamsForMedia(mediaId, config, client) {
+  try {
+    const resolved = await streamCache.getOrLoad(`${client.username}:${mediaId}`, () => client.resolveStream(mediaId));
+
+    return {
+      streams: resolved.streams.map((s, idx) => ({
+        url: buildPlayUrl(config, mediaId, idx),
+        // Show the detected quality whenever we found one (e.g. "SloFlix -
+        // 1080p"), even for a single remaining stream - not just when there
+        // are several to tell apart. Falls back to plain "SloFlix" only if
+        // no quality hint could be parsed from this source at all.
+        title: s.score ? `SloFlix - ${s.label}` : 'SloFlix',
+        // SloFlix already ships built-in/adapted Slovenian subtitles per
+        // source (sloflixClient.resolveStream() extracts subtitleUrl from
+        // subtitle_location/subtitles/subtitle) - the website's own player
+        // shows them, but until now this addon just dropped that URL on the
+        // floor instead of surfacing it, which is why Stremio/Nuvio never
+        // displayed them. Proxied through /subs/ (see below) so the SloFlix
+        // subtitle host sees the Referer/Origin it expects.
+        subtitles: s.subtitleUrl
+          ? [{ id: `sloflix-slv-${mediaId}-${idx}`, url: buildSubsUrl(config, mediaId, idx), lang: 'slv' }]
+          : undefined,
+        behaviorHints: { notWebReady: false, bingeGroup: `sloflix-${mediaId}` }
+      }))
+    };
+  } catch (err) {
+    // Resolution failed (e.g. transient SloFlix API issue) — fall back to a
+    // single lazily-resolved stream, same as before, so the title still
+    // shows a playable option instead of none. /play/ will retry resolution
+    // and surface a clear 502 if it still fails.
+    return {
+      streams: [
+        {
+          url: buildPlayUrl(config, mediaId),
+          title: 'SloFlix',
+          behaviorHints: { notWebReady: false }
+        }
+      ]
+    };
+  }
+}
+
 // ==========================================
 // Stremio addon resource handlers
 // ==========================================
@@ -342,52 +428,36 @@ builder.defineMetaHandler(async ({ type, id, config }) => {
 });
 
 builder.defineStreamHandler(async ({ type, id, config }) => {
-  const mediaId = fromId(id);
   const client = getClient(config);
+
+  // Two entry points share this handler now: our own 'sloflix:' catalog ids
+  // (mediaId known directly via fromId()), and external 'tt1234567'
+  // [':season:episode'] ids from Cinemeta/TMDB-backed catalogs - i.e. any
+  // stream-finder UI that queries every installed addon by IMDb id, not just
+  // ones browsing SloFlix's own catalog. See resolveExternalId() above.
+  let mediaId;
+  if (String(id).startsWith('sloflix:')) {
+    mediaId = fromId(id);
+  } else {
+    const [imdbId, seasonStr, episodeStr] = String(id).split(':');
+    const season = seasonStr ? parseInt(seasonStr, 10) : null;
+    const episode = episodeStr ? parseInt(episodeStr, 10) : null;
+    try {
+      mediaId = await resolveExternalId(type, client, imdbId, season, episode);
+    } catch (err) {
+      mediaId = null;
+    }
+    // No match in the SloFlix catalog for this title (or, for a series,
+    // this specific episode) - just report no streams from us, same as any
+    // other scraper would when it has nothing for a given title.
+    if (!mediaId) return { streams: [] };
+  }
 
   // Resolve now (not lazily on first /play/ hit) so Stremio/Nuvio can show
   // every available quality up front, sorted best-first, and so the actual
   // /play/ request that follows is an instant cache hit instead of doing a
   // fresh SloFlix API round-trip right when the user presses play.
-  try {
-    const resolved = await streamCache.getOrLoad(`${client.username}:${mediaId}`, () => client.resolveStream(mediaId));
-
-    return {
-      streams: resolved.streams.map((s, idx) => ({
-        url: buildPlayUrl(config, mediaId, idx),
-        // Show the detected quality whenever we found one (e.g. "SloFlix -
-        // 1080p"), even for a single remaining stream - not just when there
-        // are several to tell apart. Falls back to plain "SloFlix" only if
-        // no quality hint could be parsed from this source at all.
-        title: s.score ? `SloFlix - ${s.label}` : 'SloFlix',
-        // SloFlix already ships built-in/adapted Slovenian subtitles per
-        // source (sloflixClient.resolveStream() extracts subtitleUrl from
-        // subtitle_location/subtitles/subtitle) - the website's own player
-        // shows them, but until now this addon just dropped that URL on the
-        // floor instead of surfacing it, which is why Stremio/Nuvio never
-        // displayed them. Proxied through /subs/ (see below) so the SloFlix
-        // subtitle host sees the Referer/Origin it expects.
-        subtitles: s.subtitleUrl
-          ? [{ id: `sloflix-slv-${mediaId}-${idx}`, url: buildSubsUrl(config, mediaId, idx), lang: 'slv' }]
-          : undefined,
-        behaviorHints: { notWebReady: false, bingeGroup: `sloflix-${mediaId}` }
-      }))
-    };
-  } catch (err) {
-    // Resolution failed (e.g. transient SloFlix API issue) — fall back to a
-    // single lazily-resolved stream, same as before, so the title still
-    // shows a playable option instead of none. /play/ will retry resolution
-    // and surface a clear 502 if it still fails.
-    return {
-      streams: [
-        {
-          url: buildPlayUrl(config, mediaId),
-          title: 'SloFlix',
-          behaviorHints: { notWebReady: false }
-        }
-      ]
-    };
-  }
+  return buildStreamsForMedia(mediaId, config, client);
 });
 
 // Standalone subtitles resource: called either with an IMDb id (from ANY
@@ -421,28 +491,8 @@ builder.defineSubtitlesHandler(async ({ type, id, config }) => {
     const season = seasonStr ? parseInt(seasonStr, 10) : null;
     const episode = episodeStr ? parseInt(episodeStr, 10) : null;
 
-    const { title, year } = await titleCache.getOrLoad(`${type}:${imdbId}`, () =>
-      fetchCinemetaTitle(type, imdbId)
-    );
-    if (!title) return { subtitles: [] };
-
-    const match = await matchCache.getOrLoad(`${client.username}:${type}:${imdbId}`, async () => {
-      const results = await client.searchCatalog(title);
-      return pickBestMatch(results, title, year);
-    });
-    if (!match) return { subtitles: [] };
-
-    let mediaId = match.media_id || match.id;
-
-    if (type === 'series') {
-      if (!season || !episode) return { subtitles: [] };
-      const episodes = await matchCache.getOrLoad(`${client.username}:episodes:${mediaId}`, () =>
-        client.getShowEpisodes(mediaId)
-      );
-      const ep = episodes.find((e) => e.season === season && e.episode === episode);
-      if (!ep) return { subtitles: [] };
-      mediaId = ep.id || ep.media_id;
-    }
+    const mediaId = await resolveExternalId(type, client, imdbId, season, episode);
+    if (!mediaId) return { subtitles: [] };
 
     const subtitleUrl = await extSubtitleCache.getOrLoad(`${client.username}:${mediaId}`, () =>
       client.getSubtitleUrl(mediaId)
