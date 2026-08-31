@@ -65,6 +65,20 @@ const catalogCache = new TTLCache(CATALOG_TTL_MS);
 const streamCache = new TTLCache(STREAM_TTL_MS);
 const clientCache = new Map(); // username -> SloFlixClient (keeps the login token warm)
 
+// Caches for the standalone `subtitles` resource handler (matches any
+// IMDb-id content, from ANY addon's stream, to a SloFlix title - see
+// defineSubtitlesHandler below). Cinemeta title/year lookups and the
+// resulting SloFlix catalog match barely ever change for a given IMDb id,
+// so these are cached long; the subtitle URL itself is a static SloFlix file
+// path (unlike the short-lived signed video CDN links), so it's fine to
+// cache for a while too instead of re-searching the catalog on every check.
+const TITLE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const MATCH_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+const EXT_SUBTITLE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+const titleCache = new TTLCache(TITLE_TTL_MS);
+const matchCache = new TTLCache(MATCH_TTL_MS);
+const extSubtitleCache = new TTLCache(EXT_SUBTITLE_TTL_MS);
+
 // Reused keep-alive agents for the /play/ proxy's upstream requests to the
 // SloFlix CDN. Without these, every Range request a player makes while
 // seeking opens a brand-new TCP+TLS connection from scratch; keeping
@@ -74,12 +88,24 @@ const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 3
 
 const manifest = {
   id: 'com.jellysloflix.stremio',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'SloFlix',
   description:
-    'Glej Sloflix neposredno preko Nuvio ali Stremio, z vašim lastnim računom Sloflix.',
+    'Glej Sloflix neposredno preko Nuvio ali Stremio, z vašim lastnim računom Sloflix. Vključno s slovenskimi podnapisi SloFlix - tudi za vsebino, ki jo predvajate iz katerega koli drugega addona (Torrentio, Comet ...), ne le iz tega.',
   logo: '/icon.png', // placeholder; rewritten to an absolute URL per-request in the manifest.json override below
-  resources: ['catalog', 'meta', 'stream'],
+  // catalog/meta/stream stay scoped to our own 'sloflix:' ids exactly as
+  // before. subtitles is scoped separately to 'tt' (IMDb) ids instead -
+  // that's what lets Stremio/Nuvio query THIS addon for Slovenian subtitles
+  // no matter which addon actually supplied the video stream being played.
+  // (Our own catalog's streams already carry their subtitles inline, set in
+  // defineStreamHandler below, so this handler only needs to cover the
+  // 'tt:' case - see defineSubtitlesHandler.)
+  resources: [
+    'catalog',
+    { name: 'meta', types: ['movie', 'series'], idPrefixes: ['sloflix:'] },
+    { name: 'stream', types: ['movie', 'series'], idPrefixes: ['sloflix:'] },
+    { name: 'subtitles', types: ['movie', 'series'], idPrefixes: ['tt'] }
+  ],
   types: ['movie', 'series'],
   catalogs: [
     {
@@ -119,7 +145,6 @@ const manifest = {
       ]
     }
   ],
-  idPrefixes: ['sloflix:'],
   config: [
     { key: 'username', type: 'text', title: 'SloFlix uporabniško ime (e-pošta)' },
     { key: 'password', type: 'password', title: 'SloFlix geslo' }
@@ -165,6 +190,53 @@ function buildSubsUrl(config, mediaId, qualityIndex) {
   const configStr = encodeURIComponent(JSON.stringify(config));
   const base = `${getPublicUrl()}/${configStr}/subs/${encodeURIComponent(mediaId)}`;
   return qualityIndex === undefined ? base : `${base}/${qualityIndex}`;
+}
+
+// Same idea again, but for the standalone `subtitles` resource handler (see
+// defineSubtitlesHandler below): that path looks up subtitles by mediaId
+// alone via the lightweight client.getSubtitleUrl() (no video-source
+// probing, no quality index), so it gets its own, simpler proxy route
+// (/subs-tt/) rather than overloading /subs/'s resolveStream()-backed one.
+function buildExternalSubsUrl(config, mediaId) {
+  const configStr = encodeURIComponent(JSON.stringify(config));
+  return `${getPublicUrl()}/${configStr}/subs-tt/${encodeURIComponent(mediaId)}`;
+}
+
+function normalizeTitle(s) {
+  return (s || '').toLowerCase().trim();
+}
+
+// Cinemeta is Stremio's own, keyless, public metadata addon - used here
+// purely to turn the IMDb id Stremio/Nuvio hands the `subtitles` resource
+// into a title+year we can search the SloFlix catalog with (SloFlix has no
+// IMDb id mapping of its own, same limitation as the TMDB-based Nuvio local
+// scraper in this project).
+async function fetchCinemetaTitle(type, imdbId) {
+  const cinemetaType = type === 'series' ? 'series' : 'movie';
+  const res = await fetch(`https://v3-cinemeta.strem.io/meta/${cinemetaType}/${imdbId}.json`);
+  const data = await res.json().catch(() => null);
+  const meta = data && data.meta;
+  if (!meta || !meta.name) return { title: null, year: null };
+  return {
+    title: meta.name,
+    year: ((meta.year || meta.released || '') + '').slice(0, 4)
+  };
+}
+
+// Best-effort title/year match against SloFlix search results: titles are
+// matched exactly (case/whitespace-insensitive) against either the
+// Slovenian or English name field, preferring whichever candidate's year
+// matches Cinemeta's.
+function pickBestMatch(results, title, year) {
+  const t = normalizeTitle(title);
+  let best = null;
+  for (const item of results) {
+    const names = [item.media_name, item.media_name_en].map(normalizeTitle);
+    if (!names.includes(t)) continue;
+    const itemYear = (item.media_year || '') + '';
+    if (!best || itemYear === year) best = item;
+  }
+  return best || null;
 }
 
 // Maps a custom catalog id to the SloFlix genre tag (as seen in the
@@ -284,6 +356,61 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
   }
 });
 
+// Standalone subtitles resource: called with an IMDb id (scoped to 'tt' via
+// the per-resource idPrefixes above), independent of which addon actually
+// supplies the video stream being played. Not invoked for our own catalog's
+// 'sloflix:' ids - those already get their subtitles attached directly on
+// the stream object in defineStreamHandler above, so there's nothing extra
+// to do for them here.
+builder.defineSubtitlesHandler(async ({ type, id, config }) => {
+  try {
+    const client = getClient(config);
+
+    // id is "tt1234567" for a movie, or "tt1234567:1:5" (season:episode) for
+    // a series episode.
+    const [imdbId, seasonStr, episodeStr] = String(id).split(':');
+    const season = seasonStr ? parseInt(seasonStr, 10) : null;
+    const episode = episodeStr ? parseInt(episodeStr, 10) : null;
+
+    const { title, year } = await titleCache.getOrLoad(`${type}:${imdbId}`, () =>
+      fetchCinemetaTitle(type, imdbId)
+    );
+    if (!title) return { subtitles: [] };
+
+    const match = await matchCache.getOrLoad(`${client.username}:${type}:${imdbId}`, async () => {
+      const results = await client.searchCatalog(title);
+      return pickBestMatch(results, title, year);
+    });
+    if (!match) return { subtitles: [] };
+
+    let mediaId = match.media_id || match.id;
+
+    if (type === 'series') {
+      if (!season || !episode) return { subtitles: [] };
+      const episodes = await matchCache.getOrLoad(`${client.username}:episodes:${mediaId}`, () =>
+        client.getShowEpisodes(mediaId)
+      );
+      const ep = episodes.find((e) => e.season === season && e.episode === episode);
+      if (!ep) return { subtitles: [] };
+      mediaId = ep.id || ep.media_id;
+    }
+
+    const subtitleUrl = await extSubtitleCache.getOrLoad(`${client.username}:${mediaId}`, () =>
+      client.getSubtitleUrl(mediaId)
+    );
+    if (!subtitleUrl) return { subtitles: [] };
+
+    return {
+      subtitles: [{ id: `sloflix-slv-${mediaId}`, url: buildExternalSubsUrl(config, mediaId), lang: 'slv' }]
+    };
+  } catch (err) {
+    // Any failure here (SloFlix down, no title match, ...) just means "no
+    // subtitles from this addon this time" - it must never break playback of
+    // whichever addon actually supplies the video.
+    return { subtitles: [] };
+  }
+});
+
 // ==========================================
 // HTTP app: Stremio addon router + /play/ streaming proxy
 // ==========================================
@@ -380,6 +507,35 @@ app.get('/:config/subs/:mediaId/:qualityIndex?', async (req, res) => {
     }
 
     await proxySubtitle(req, res, stream.subtitleUrl);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(502).send('SloFlix subtitle proxy error: ' + err.message);
+    } else {
+      res.end();
+    }
+  }
+});
+
+// Lighter counterpart to /subs/ above, used by defineSubtitlesHandler
+// (arbitrary IMDb-id content matched to a SloFlix title): looks up the
+// subtitle URL directly via client.getSubtitleUrl() instead of the full
+// resolveStream() (which also probes/scores actual video sources - wasted
+// work here, since all we need is the subtitle track).
+app.get('/:config/subs-tt/:mediaId', async (req, res) => {
+  try {
+    const config = JSON.parse(decodeURIComponent(req.params.config));
+    const client = getClient(config);
+    const mediaId = req.params.mediaId;
+
+    const subtitleUrl = await extSubtitleCache.getOrLoad(`${client.username}:${mediaId}`, () =>
+      client.getSubtitleUrl(mediaId)
+    );
+    if (!subtitleUrl) {
+      res.status(404).send('Za to vsebino ni na voljo slovenskih podnapisov.');
+      return;
+    }
+
+    await proxySubtitle(req, res, subtitleUrl);
   } catch (err) {
     if (!res.headersSent) {
       res.status(502).send('SloFlix subtitle proxy error: ' + err.message);
