@@ -573,6 +573,21 @@ app.get('/:config/play/:mediaId/:qualityIndex?', async (req, res) => {
     const stream =
       (!isNaN(requestedIndex) && resolved.streams[requestedIndex]) || resolved.streams[0];
 
+    // Many stream-finder frontends (AIOStreams-style aggregators) probe
+    // every returned stream URL right after listing it, to prune dead
+    // sources - and that probe is frequently a plain HEAD request. SloFlix's
+    // signed CDN links are meant for ranged GET only and often answer HEAD
+    // with an error/empty response, which made those probes fail and the
+    // aggregator quietly drop the SloFlix result a moment after first
+    // showing it - even though the source was actually fine. So: once we've
+    // confirmed above that this mediaId/quality genuinely resolves to a
+    // live SloFlix source, answer HEAD ourselves with plain "yes, this is
+    // playable" headers instead of forwarding HEAD to the flaky upstream.
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes' });
+      return res.end();
+    }
+
     await proxyStream(req, res, stream.streamUrl);
   } catch (err) {
     if (!res.headersSent) {
