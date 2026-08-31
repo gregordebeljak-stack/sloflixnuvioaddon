@@ -88,7 +88,7 @@ const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 3
 
 const manifest = {
   id: 'com.jellysloflix.stremio',
-  version: '1.2.0',
+  version: '1.3.0',
   name: 'SloFlix',
   description:
     'Glej Sloflix neposredno preko Nuvio ali Stremio, z vašim lastnim računom Sloflix. Vključno s slovenskimi podnapisi SloFlix - tudi za vsebino, ki jo predvajate iz katerega koli drugega addona (Torrentio, Comet ...), ne le iz tega.',
@@ -104,7 +104,12 @@ const manifest = {
     'catalog',
     { name: 'meta', types: ['movie', 'series'], idPrefixes: ['sloflix:'] },
     { name: 'stream', types: ['movie', 'series'], idPrefixes: ['sloflix:'] },
-    { name: 'subtitles', types: ['movie', 'series'], idPrefixes: ['tt'] }
+    // 'sloflix:' is included here (alongside 'tt') so Nuvio's own subtitle
+    // picker - which only ever queries this standalone resource, and does
+    // NOT read the inline `subtitles` array set on stream objects in
+    // defineStreamHandler below - also gets results for our own catalog
+    // titles, not just for content played from other addons.
+    { name: 'subtitles', types: ['movie', 'series'], idPrefixes: ['tt', 'sloflix:'] }
   ],
   types: ['movie', 'series'],
   catalogs: [
@@ -356,18 +361,33 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
   }
 });
 
-// Standalone subtitles resource: called with an IMDb id (scoped to 'tt' via
-// the per-resource idPrefixes above), independent of which addon actually
-// supplies the video stream being played. Not invoked for our own catalog's
-// 'sloflix:' ids - those already get their subtitles attached directly on
-// the stream object in defineStreamHandler above, so there's nothing extra
-// to do for them here.
+// Standalone subtitles resource: called either with an IMDb id (from ANY
+// addon's stream, scoped via 'tt' in the per-resource idPrefixes above), or
+// with one of our own 'sloflix:' ids. The latter was added because Nuvio's
+// subtitle picker only ever queries THIS resource - unlike Stremio, it does
+// not read the inline `subtitles` array already set on stream objects in
+// defineStreamHandler above - so without it, our own catalog's titles never
+// showed subtitles in Nuvio despite the video stream coming from us too.
 builder.defineSubtitlesHandler(async ({ type, id, config }) => {
   try {
     const client = getClient(config);
 
-    // id is "tt1234567" for a movie, or "tt1234567:1:5" (season:episode) for
-    // a series episode.
+    // Our own catalog ids need no title search at all - fromId() gives back
+    // the exact SloFlix media id directly (each episode already has its own
+    // unique id, so no season/episode lookup is needed here either).
+    if (String(id).startsWith('sloflix:')) {
+      const mediaId = fromId(id);
+      const subtitleUrl = await extSubtitleCache.getOrLoad(`${client.username}:${mediaId}`, () =>
+        client.getSubtitleUrl(mediaId)
+      );
+      if (!subtitleUrl) return { subtitles: [] };
+      return {
+        subtitles: [{ id: `sloflix-slv-${mediaId}`, url: buildExternalSubsUrl(config, mediaId), lang: 'slv' }]
+      };
+    }
+
+    // Otherwise id is "tt1234567" for a movie, or "tt1234567:1:5"
+    // (season:episode) for a series episode, from some other addon's stream.
     const [imdbId, seasonStr, episodeStr] = String(id).split(':');
     const season = seasonStr ? parseInt(seasonStr, 10) : null;
     const episode = episodeStr ? parseInt(episodeStr, 10) : null;
