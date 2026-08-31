@@ -392,7 +392,16 @@ builder.defineCatalogHandler(async ({ type, id, extra, config }) => {
 
   if (genreFilter) {
     items = items.filter((item) => pickGenres(item).includes(genreFilter));
-  } else if (BASE_CATALOGS.has(id)) {
+  } else if (!search && BASE_CATALOGS.has(id)) {
+    // Only hide Slovenski/SLOSiNH items from the plain browse view of the
+    // base catalogs (so they don't show twice - once here, once in their own
+    // dedicated row). During a *search*, Nuvio's unified/global search bar
+    // typically only queries each addon's default (base) catalog per type -
+    // it does not separately query all of SloFlix's genre-specific catalogs
+    // too. Applying this same exclusion to search results meant anything
+    // tagged Slovenski/SLOSiNH (e.g. "Stekle lisice") could never be found
+    // through Nuvio's search at all, even though it exists in the SloFlix
+    // catalog - so search results are left unfiltered by genre here.
     items = items.filter((item) => !pickGenres(item).some((g) => EXCLUDED_FROM_BASE_GENRES.includes(g)));
   }
 
