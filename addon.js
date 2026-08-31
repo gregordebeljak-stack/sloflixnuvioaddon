@@ -148,6 +148,24 @@ const manifest = {
         { name: 'search', isRequired: false },
         { name: 'skip', isRequired: false }
       ]
+    },
+    {
+      type: 'series',
+      id: 'sloflix-slovenski-series',
+      name: 'SloFlix Slovenske serije',
+      extra: [
+        { name: 'search', isRequired: false },
+        { name: 'skip', isRequired: false }
+      ]
+    },
+    {
+      type: 'series',
+      id: 'sloflix-slosinh-series',
+      name: 'SloFlix SLOSiNH (risanke in risane serije)',
+      extra: [
+        { name: 'search', isRequired: false },
+        { name: 'skip', isRequired: false }
+      ]
     }
   ],
   config: [
@@ -249,7 +267,9 @@ function pickBestMatch(results, title, year) {
 // "Slovenski" or "SLOSiNH") it should be restricted to.
 const GENRE_CATALOGS = {
   'sloflix-slovenski': 'Slovenski',
-  'sloflix-slosinh': 'SLOSiNH'
+  'sloflix-slosinh': 'SLOSiNH',
+  'sloflix-slovenski-series': 'Slovenski',
+  'sloflix-slosinh-series': 'SLOSiNH'
 };
 
 // ==========================================
