@@ -272,6 +272,13 @@ const GENRE_CATALOGS = {
   'sloflix-slosinh-series': 'SLOSiNH'
 };
 
+// The base (unfiltered) catalogs skip any item already covered by one of the
+// genre-specific catalogs above, so a Slovenian movie/show shows up in
+// "SloFlix Slovenski filmi"/"SloFlix Slovenske serije" instead of ALSO
+// cluttering the main "SloFlix Filmi"/"SloFlix Serije" listing.
+const BASE_CATALOGS = new Set(['sloflix-movies', 'sloflix-series']);
+const EXCLUDED_FROM_BASE_GENRES = [...new Set(Object.values(GENRE_CATALOGS))];
+
 // ==========================================
 // Stremio addon resource handlers
 // ==========================================
@@ -299,6 +306,8 @@ builder.defineCatalogHandler(async ({ type, id, extra, config }) => {
 
   if (genreFilter) {
     items = items.filter((item) => pickGenres(item).includes(genreFilter));
+  } else if (BASE_CATALOGS.has(id)) {
+    items = items.filter((item) => !pickGenres(item).some((g) => EXCLUDED_FROM_BASE_GENRES.includes(g)));
   }
 
   // Sort newest year first (same as SloFlix's own "Leto: najprej novejše"
